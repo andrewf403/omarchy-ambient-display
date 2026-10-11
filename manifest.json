@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "id": "andrewf.ambient-display",
+  "name": "Ambient Display",
+  "version": "1.0.0",
+  "author": "Andrii F",
+  "license": "MIT",
+  "description": "Automatic screen brightness and white balance from the laptop light sensor.",
+  "kinds": ["service", "bar-widget"],
+  "keepLoaded": false,
+  "entryPoints": {"service": "AmbientService.qml", "barWidget": "Panel.qml"},
+  "barWidget": {
+    "displayName": "Ambient Display",
+    "description": "Ambient brightness and color temperature",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
