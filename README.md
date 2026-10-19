@@ -47,8 +47,19 @@ chasing sensor noise. Manual brightness changes pause automation for 10 seconds.
 Disabling automatic brightness restores the exact pre-enable brightness;
 ordinary brightness keys and the stock display panel remain available.
 
-Color follows `in_colortemp_raw - 550`, limited to 4000–6500 K, with roughly
-20-second smoothing and 100 K update thresholds. This is a provisional
+Color follows `in_colortemp_raw - 550`, limited to 4000–6500 K. Every 2 seconds,
+it takes a reading and calculates the median of the latest 5 readings (an
+8-second span). It waits for all 5 readings before applying color, including
+after enabling, waking, a sensor error, or resuming from a manual override.
+The median rejects isolated spikes, including up to 2 outliers in a full window.
+A new ambient target is accepted only when that median differs from the last
+accepted target by at least 300 K. The display gradually approaches this target
+with roughly 20-second exponential smoothing (10% per update), writing only
+when the smoothed value differs from the current display temperature by at
+least 100 K. A sustained change takes tens of seconds to settle; this deliberately
+favors stable color over immediate reactions. The panel's ambient reading is
+still live sensor data; IPC status also exposes `filteredAmbientKelvin`.
+This is a provisional
 desk-specific comparison against a BenQ Halo 2, not an absolute calibration.
 The UM3406HA's advertised 0.1 color scale is intentionally bypassed. Its
 chromaticity fields read zero; raw color 7000 may be clipped.

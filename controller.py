@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """One controller per session; newline JSON commands/status over stdin/stdout."""
 import ctypes
+from collections import deque
 import fcntl
 import json
 import math
@@ -9,12 +10,17 @@ from pathlib import Path
 import select
 import shutil
 import signal
+import statistics
 import subprocess
 import sys
 import time
 
 
 FADE_INTERVAL = 0.025
+COLOR_INTERVAL = 2
+COLOR_MEDIAN_SAMPLES = 5
+COLOR_TARGET_THRESHOLD = 300
+COLOR_OUTPUT_THRESHOLD = 100
 
 
 def clamp(value, low, high):
@@ -135,12 +141,11 @@ class Controller:
         self.manual_until = 0
         self.lux = None
         self.raw_kelvin = None
-        self.smoothed_color = None
+        self.reset_color_filter()
         self.current_brightness = None
         self.error = ''
         self.failures = 0
         self.quit = False
-        self.first_color_sample = True
         self.brightness_fade = None
         self.brightness_goal = None
         self.next_color_tick = 0
@@ -150,6 +155,23 @@ class Controller:
         temporary = self.path.with_suffix('.tmp')
         temporary.write_text(json.dumps(self.state, indent=2) + '\n')
         temporary.replace(self.path)
+
+    def reset_color_filter(self):
+        self.color_samples = deque(maxlen=COLOR_MEDIAN_SAMPLES)
+        self.accepted_color = None
+        self.smoothed_color = None
+
+    def filter_color(self, raw, current):
+        self.color_samples.append(color_target(raw))
+        # Wait for a full window so startup spikes get rejected too.
+        if len(self.color_samples) < COLOR_MEDIAN_SAMPLES:
+            return None
+        filtered = statistics.median(self.color_samples)
+        if self.accepted_color is None or abs(filtered - self.accepted_color) >= COLOR_TARGET_THRESHOLD:
+            self.accepted_color = filtered
+        initial = current if self.smoothed_color is None else self.smoothed_color
+        self.smoothed_color = initial * 0.9 + self.accepted_color * 0.1
+        return round(self.smoothed_color)
 
     def restore_brightness(self):
         self.cancel_fade()
@@ -167,7 +189,7 @@ class Controller:
         if last is not None and self.hw.temperature() == last:
             self.hw.identity()
         self.state['lastColor'] = None
-        self.smoothed_color = None
+        self.reset_color_filter()
         self.color_paused = False
 
     def command(self, command):
@@ -182,6 +204,7 @@ class Controller:
             self.idle = command['idle'] is True
             if self.idle:
                 self.cancel_fade()
+                self.reset_color_filter()
         if 'offset' in command:
             value = float(command['offset'])
             if not math.isfinite(value):
@@ -204,7 +227,7 @@ class Controller:
                 self.next_color_tick = 0
                 self.hw.ensure_color()
                 self.color_paused = False
-                self.smoothed_color = None
+                self.reset_color_filter()
                 current = self.hw.temperature()
                 # Existing Night Light keeps ownership until it is turned off.
                 if self.state['lastColor'] is None and current is not None and current < 6000:
@@ -256,6 +279,7 @@ class Controller:
             self.lux, self.raw_kelvin = self.hw.sample()
             self.failures = 0
         except (OSError, ValueError, RuntimeError) as e:
+            self.reset_color_filter()
             self.failures += 1
             if self.failures == 5:
                 self.restore_brightness()
@@ -268,6 +292,7 @@ class Controller:
             return
         if self.idle or time.monotonic() < self.resume_cooldown or not self.hw.screen_awake():
             self.cancel_fade()
+            self.reset_color_filter()
             return
 
         if self.state['autoBrightness']:
@@ -286,30 +311,29 @@ class Controller:
         if self.state['autoColor']:
             if time.monotonic() < self.next_color_tick:
                 return
-            self.next_color_tick = time.monotonic() + 2
+            self.next_color_tick = time.monotonic() + COLOR_INTERVAL
             current_color = self.hw.temperature()
             if current_color is None:
                 self.hw.ensure_color()
                 current_color = self.hw.temperature()
                 self.state['lastColor'] = None
+                self.reset_color_filter()
             last = self.state['lastColor']
-            if self.first_color_sample and last is None and current_color is not None and current_color < 6000:
+            if last is None and current_color is not None and current_color < 6000:
                 self.color_paused = True
-            self.first_color_sample = False
+                self.reset_color_filter()
             if last is not None and current_color != last:
                 self.color_paused = True
                 self.state['lastColor'] = None
+                self.reset_color_filter()
             if self.color_paused:
                 if current_color is None or current_color < 6000:
                     return
                 self.color_paused = False
-                self.smoothed_color = None
-            target = color_target(self.raw_kelvin)
+                self.reset_color_filter()
             initial = current_color if current_color is not None else 6500
-            self.smoothed_color = (initial * 0.9 + target * 0.1 if self.smoothed_color is None
-                                   else self.smoothed_color * 0.9 + target * 0.1)
-            proposed = round(self.smoothed_color)
-            if current_color is None or abs(proposed - current_color) >= 100:
+            proposed = self.filter_color(self.raw_kelvin, initial)
+            if proposed is not None and (current_color is None or abs(proposed - current_color) >= COLOR_OUTPUT_THRESHOLD):
                 self.hw.set_temperature(proposed)
                 self.state['lastColor'] = proposed
                 self.save()
@@ -319,6 +343,8 @@ class Controller:
                 'autoBrightness': self.state['autoBrightness'], 'autoColor': self.state['autoColor'],
                 'offset': self.state['offset'], 'lux': self.lux,
                 'ambientKelvin': round(self.raw_kelvin - 550) if self.raw_kelvin is not None else None,
+                'filteredAmbientKelvin': round(statistics.median(self.color_samples))
+                    if len(self.color_samples) == COLOR_MEDIAN_SAMPLES else None,
                 'targetKelvin': round(self.smoothed_color) if self.smoothed_color is not None else None,
                 'brightness': self.current_brightness, 'brightnessAvailable': self.hw.backlight is not None,
                 'colorAvailable': shutil.which('hyprsunset') is not None,

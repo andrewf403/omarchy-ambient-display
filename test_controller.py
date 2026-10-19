@@ -52,6 +52,20 @@ class Tests(unittest.TestCase):
         self.clock.return_value += seconds
         self.c.fade_step()
 
+    def color_ticks(self, count):
+        for _ in range(count):
+            self.clock.return_value += 2
+            self.c.tick()
+
+    def steady_color(self, kelvin=5000):
+        self.hw.temp = kelvin
+        self.hw.raw = kelvin + 550
+        # Simulate an already adapted controller that owns its current setting.
+        self.c.state['autoColor'] = True
+        self.c.state['lastColor'] = kelvin
+        self.color_ticks(5)
+        self.hw.writes.clear()
+
     def test_disabled_controller_only_observes(self):
         self.c.tick()
         self.c.cleanup()
@@ -117,7 +131,7 @@ class Tests(unittest.TestCase):
 
     def test_nightlight_override_is_preserved_on_disable(self):
         self.c.command({'autoColor': True})
-        self.c.tick()
+        self.color_ticks(5)
         self.hw.temp = 4000
         self.clock.return_value += 2
         self.c.tick()
@@ -132,10 +146,99 @@ class Tests(unittest.TestCase):
         self.assertTrue(self.c.color_paused)
         self.assertEqual(self.hw.writes, [])
         self.hw.temp = 6500
-        self.clock.return_value += 2
-        self.c.tick()
+        self.color_ticks(5)
         self.assertFalse(self.c.color_paused)
         self.assertNotEqual(self.hw.writes, [])
+
+    def test_color_waits_for_a_full_window_and_rejects_startup_spikes(self):
+        self.c.command({'autoColor': True})
+        for raw in (4550, 4550, 7050, 4550):
+            self.hw.raw = raw
+            self.color_ticks(1)
+        self.assertEqual(self.hw.writes, [])
+        self.hw.raw = 4550
+        self.color_ticks(1)
+        self.assertEqual(self.hw.temp, 6250)
+        self.assertEqual(self.c.accepted_color, 4000)
+
+    def test_color_rejects_two_large_outliers(self):
+        self.steady_color()
+        for raw in (7050, 7050, 5550, 5550, 5550, 5550):
+            self.hw.raw = raw
+            self.color_ticks(1)
+        self.assertEqual(self.hw.writes, [])
+        self.assertEqual(self.hw.temp, 5000)
+
+    def test_small_color_noise_does_not_move_the_accepted_target(self):
+        self.steady_color()
+        for raw in [5700, 5650, 5400, 5450, 5600, 5500] * 5:
+            self.hw.raw = raw
+            self.color_ticks(1)
+        self.assertEqual(self.hw.writes, [])
+        self.assertEqual(self.c.accepted_color, 5000)
+
+    def test_color_requires_a_300_kelvin_median_change(self):
+        self.steady_color()
+        self.hw.raw = 5849
+        self.color_ticks(10)
+        self.assertEqual(self.hw.writes, [])
+        self.hw.raw = 5850
+        self.color_ticks(3)
+        self.assertEqual(self.c.accepted_color, 5300)
+        self.color_ticks(10)
+        self.assertGreaterEqual(self.hw.temp, 5100)
+        self.assertLessEqual(self.hw.temp, 5300)
+
+    def test_sustained_color_change_is_followed_gradually(self):
+        self.steady_color()
+        self.hw.raw = 6550
+        self.color_ticks(2)
+        self.assertEqual(self.hw.writes, [])
+        self.color_ticks(1)
+        self.assertEqual(self.hw.temp, 5100)
+        self.color_ticks(45)
+        self.assertGreaterEqual(self.hw.temp, 5900)
+        self.assertLessEqual(self.hw.temp, 6000)
+        self.assertFalse(self.c.color_paused)
+
+    def test_color_does_not_sample_the_same_instant_more_than_once(self):
+        self.c.command({'autoColor': True})
+        for _ in range(5): self.c.tick()
+        self.assertEqual(len(self.c.color_samples), 1)
+        self.assertEqual(self.hw.writes, [])
+
+    def test_manual_nightlight_during_color_warmup_is_preserved(self):
+        self.c.command({'autoColor': True})
+        self.color_ticks(1)
+        self.hw.temp = 4000
+        self.color_ticks(10)
+        self.assertTrue(self.c.color_paused)
+        self.assertEqual(self.hw.writes, [])
+        self.c.command({'autoColor': False})
+        self.assertEqual(self.hw.temp, 4000)
+
+    def test_idle_wake_uses_fresh_color_samples(self):
+        self.steady_color()
+        self.c.command({'idle': True})
+        self.hw.raw = 6550
+        self.color_ticks(10)
+        self.assertEqual(len(self.c.color_samples), 0)
+        self.c.command({'idle': False})
+        self.clock.return_value += 4
+        self.color_ticks(4)
+        self.assertEqual(self.hw.writes, [])
+        self.color_ticks(1)
+        self.assertEqual(self.hw.temp, 5100)
+
+    def test_sensor_error_discards_old_color_samples(self):
+        self.steady_color()
+        self.hw.failed = True
+        with self.assertRaises(RuntimeError): self.c.tick()
+        self.assertEqual(len(self.c.color_samples), 0)
+        self.hw.failed = False
+        self.hw.raw = 6550
+        self.color_ticks(4)
+        self.assertEqual(self.hw.writes, [])
 
     def test_idle_and_dpms_do_not_change_display(self):
         self.c.command({'autoBrightness': True, 'autoColor': True})
@@ -223,7 +326,7 @@ class Tests(unittest.TestCase):
 
     def test_cleanup_restores_but_preserves_enable_intent(self):
         self.c.command({'autoBrightness': True, 'autoColor': True})
-        self.c.tick()
+        self.color_ticks(5)
         self.c.cleanup()
         self.assertEqual(self.hw.value, 38)
         self.assertEqual(self.hw.writes[-1], ('identity',))
